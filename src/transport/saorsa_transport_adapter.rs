@@ -156,9 +156,15 @@ const HAPPY_EYEBALLS_V4_STAGGER: Duration = Duration::from_millis(50);
 
 /// Per-attempt direct connect timeout used by the Happy Eyeballs race.
 ///
-/// Keep this short because DHT lookups expect to encounter unreachable
-/// candidates on live networks and should move on quickly.
-const DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+/// Bumped from 1s to 10s for testnet runs: cross-region QUIC handshakes
+/// (~70-200ms RTT × 3-4 round trips for full setup, plus PQC) routinely
+/// take 300-800ms even on healthy paths. The 1s budget caused the
+/// anselme-testnet client to fail every cross-region bootstrap attempt
+/// on 2026-05-08. The DoS argument for keeping it short still applies
+/// for unreachable candidates, but unreachable candidates also fail the
+/// initial UDP send long before this timer fires, so the 10s limit only
+/// kicks in on slow-but-progressing handshakes.
+const DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Per-attempt direct handshake timeout after connection progress is observed.
 const DIRECT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(4);
