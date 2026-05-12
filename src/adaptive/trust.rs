@@ -810,4 +810,183 @@ mod tests {
             "after {success_rounds} weight-3 successes, score {restored_score} should be >= {TRUST_PROTECTION_THRESHOLD}"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Bad-binding eviction: ApplicationFailure(MAX_CONSUMER_WEIGHT) is
+    // sufficient to push a peer out of the lookup-eligible band in one shot.
+    //
+    // The production swap-out threshold lives in `AdaptiveDhtConfig`
+    // (`adaptive::dht::DEFAULT_SWAP_THRESHOLD = 0.35`). plan-1-bad-node-eviction
+    // also calls out the looser sanity bound of 0.4. We assert against both
+    // so a future tweak to either knob still flags this test.
+    // -----------------------------------------------------------------------
+
+    use crate::adaptive::TrustEvent;
+    use crate::adaptive::dht::{DEFAULT_SWAP_THRESHOLD, MAX_CONSUMER_WEIGHT};
+
+    /// Looser sanity bound from plan-1-bad-node-eviction.md.
+    const PLAN_LOOKUP_SKIP_BOUND: f64 = 0.4;
+
+    /// Drive a `TrustEvent` through the same `clamped_update` gate that
+    /// `AdaptiveDHT::report_trust_event` uses, so tests exercise the
+    /// public-API clamping/zero-weight-guard rather than the raw
+    /// `TrustEngine::update_node_stats_weighted` entry. Mirrors the body of
+    /// `AdaptiveDHT::report_trust_event` exactly; both call sites share
+    /// `TrustEvent::clamped_update` as the single source of truth for the
+    /// gate.
+    fn report_via_public_api(engine: &TrustEngine, peer: &PeerId, event: TrustEvent) {
+        if let Some((stats_update, weight)) = event.clamped_update() {
+            engine.update_node_stats_weighted(peer, stats_update, weight);
+        }
+    }
+
+    /// A1: A single `ApplicationFailure(MAX_CONSUMER_WEIGHT)` drops a peer
+    /// from neutral 0.5 to below the production swap threshold (and the
+    /// looser 0.4 plan target) in one shot. Proves one bad-binding
+    /// detection is enough to evict the offender from lookup-eligible
+    /// candidates.
+    ///
+    /// Drives the event through `report_via_public_api` so the
+    /// `clamped_update` gate (clamping + zero-weight guard) is on the test
+    /// path, not just `TrustEngine`'s raw write.
+    #[tokio::test]
+    async fn bad_binding_event_drops_peer_below_lookup_threshold() {
+        let engine = TrustEngine::new();
+        let peer = PeerId::random();
+
+        report_via_public_api(
+            &engine,
+            &peer,
+            TrustEvent::ApplicationFailure(MAX_CONSUMER_WEIGHT),
+        );
+
+        let score = engine.score(&peer);
+        assert!(
+            score < PLAN_LOOKUP_SKIP_BOUND,
+            "one weight-{MAX_CONSUMER_WEIGHT} failure should drop score below {PLAN_LOOKUP_SKIP_BOUND}, got {score}"
+        );
+        assert!(
+            score < DEFAULT_SWAP_THRESHOLD,
+            "score {score} should also be below the production swap threshold {DEFAULT_SWAP_THRESHOLD}"
+        );
+        assert!(
+            score >= MIN_TRUST_SCORE,
+            "score {score} must remain inside the legal range"
+        );
+    }
+
+    /// A2: A peer downscored by one bad-binding event recovers above the
+    /// swap threshold after ~1 day of decay. Eviction is *temporary*: a
+    /// peer that fixes its config re-enters the lookup pool naturally.
+    ///
+    /// `DECAY_LAMBDA` is tuned so the worst score (0.0) recovers above the
+    /// swap threshold in ~1 day; from ~0.26 we need less. We assert the
+    /// score has crossed back above the threshold within a single 24h
+    /// elapsed window since the failure, matching the contract documented
+    /// on `DECAY_LAMBDA`.
+    #[tokio::test]
+    async fn bad_binding_decays_back_above_threshold_within_one_day() {
+        let engine = TrustEngine::new();
+        let peer = PeerId::random();
+
+        report_via_public_api(
+            &engine,
+            &peer,
+            TrustEvent::ApplicationFailure(MAX_CONSUMER_WEIGHT),
+        );
+        let after_failure = engine.score(&peer);
+        assert!(
+            after_failure < DEFAULT_SWAP_THRESHOLD,
+            "post-failure score {after_failure} should be below {DEFAULT_SWAP_THRESHOLD}"
+        );
+
+        let one_day = std::time::Duration::from_secs(24 * 3600);
+        engine.simulate_elapsed(&peer, one_day).await;
+        let after_one_day = engine.score(&peer);
+        assert!(
+            after_one_day > after_failure,
+            "score should decay toward neutral over 24h: {after_failure} -> {after_one_day}"
+        );
+        assert!(
+            after_one_day >= DEFAULT_SWAP_THRESHOLD,
+            "after 24h of decay the score {after_one_day} should be back above the swap threshold {DEFAULT_SWAP_THRESHOLD}"
+        );
+    }
+
+    /// A3: 10 consecutive bad-binding events keep the score inside
+    /// `[MIN_TRUST_SCORE, swap_threshold)`. Confirms the EMA arithmetic
+    /// does not produce negative or NaN scores under repeated punishment.
+    #[tokio::test]
+    async fn multiple_bad_bindings_dont_compound_pathologically() {
+        let engine = TrustEngine::new();
+        let peer = PeerId::random();
+
+        for _ in 0..10 {
+            report_via_public_api(
+                &engine,
+                &peer,
+                TrustEvent::ApplicationFailure(MAX_CONSUMER_WEIGHT),
+            );
+        }
+
+        let score = engine.score(&peer);
+        assert!(score.is_finite(), "score {score} must remain finite");
+        assert!(
+            (MIN_TRUST_SCORE..PLAN_LOOKUP_SKIP_BOUND).contains(&score),
+            "after 10 weight-{MAX_CONSUMER_WEIGHT} failures, score {score} must lie in [{MIN_TRUST_SCORE}, {PLAN_LOOKUP_SKIP_BOUND})"
+        );
+    }
+
+    /// A4: The public-API clamp + zero/negative-weight guard live on
+    /// `TrustEvent::clamped_update`. A consumer event with a weight above
+    /// `MAX_CONSUMER_WEIGHT` is clamped (so a malicious caller cannot
+    /// over-penalise a peer); a non-positive or non-finite weight is
+    /// silently dropped (so a buggy caller cannot accidentally credit a
+    /// success or NaN-poison the EMA).
+    ///
+    /// This is the test the reviewer asked for: the PR's whole purpose is
+    /// to expose `report_application_failure` as a public surface, so the
+    /// gating logic that surface relies on must be exercised.
+    #[tokio::test]
+    async fn clamped_update_clamps_weight_and_drops_non_positive() {
+        // Above-cap weight: clamps down to MAX_CONSUMER_WEIGHT, equivalent
+        // to passing exactly the cap. Tolerance accounts for the µs-level
+        // decay drift between the two `record_weighted` calls — both
+        // engines independently sample `Instant::now()` so the scores agree
+        // to within decay over a handful of microseconds, not bit-for-bit.
+        let engine_clamped = TrustEngine::new();
+        let engine_at_cap = TrustEngine::new();
+        let peer = PeerId::random();
+        report_via_public_api(
+            &engine_clamped,
+            &peer,
+            TrustEvent::ApplicationFailure(MAX_CONSUMER_WEIGHT * 100.0),
+        );
+        report_via_public_api(
+            &engine_at_cap,
+            &peer,
+            TrustEvent::ApplicationFailure(MAX_CONSUMER_WEIGHT),
+        );
+        let drift = (engine_clamped.score(&peer) - engine_at_cap.score(&peer)).abs();
+        assert!(
+            drift < 1e-6,
+            "weights above MAX_CONSUMER_WEIGHT must clamp to the cap; \
+             scores diverged by {drift} (clamped={}, at_cap={})",
+            engine_clamped.score(&peer),
+            engine_at_cap.score(&peer),
+        );
+
+        // Zero / negative / NaN weight: gate drops the event entirely. The
+        // peer keeps the neutral score it started with.
+        for bad_weight in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let engine = TrustEngine::new();
+            let peer = PeerId::random();
+            report_via_public_api(&engine, &peer, TrustEvent::ApplicationFailure(bad_weight));
+            assert!(
+                (engine.score(&peer) - DEFAULT_NEUTRAL_TRUST).abs() < f64::EPSILON,
+                "weight {bad_weight} must be a no-op, score {} should equal neutral {DEFAULT_NEUTRAL_TRUST}",
+                engine.score(&peer)
+            );
+        }
+    }
 }
